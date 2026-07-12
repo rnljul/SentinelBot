@@ -1,0 +1,12 @@
+services:
+  sentinel-bot:
+    build: .
+    container_name: sentinel-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - sentinel-bot-data:/app/data
+
+volumes:
+  sentinel-bot-data:

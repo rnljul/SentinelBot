@@ -103,3 +103,63 @@ Instead:
 ## Deploying
 
 For production, run the bot under a process manager such as `systemd`, Docker, or a hosting platform that supports long-running Python processes.
+
+## Docker
+
+The project includes a `Dockerfile` and `docker-compose.yml` for deployment from GitHub.
+
+### Run locally with Docker Compose
+
+Create `.env` from the example and set your bot token:
+
+```bash
+cp .env.example .env
+```
+
+Start the bot:
+
+```bash
+docker compose up -d --build
+```
+
+View logs:
+
+```bash
+docker compose logs -f sentinel-bot
+```
+
+Stop the bot:
+
+```bash
+docker compose down
+```
+
+Restriction data is stored in a Docker volume at `/app/data`, so it survives container rebuilds.
+
+### Build and run without Compose
+
+```bash
+docker build -t sentinel-bot .
+docker run -d \
+  --name sentinel-bot \
+  --restart unless-stopped \
+  --env-file .env \
+  -v sentinel-bot-data:/app/data \
+  sentinel-bot
+```
+
+### Deploy from GitHub
+
+On your server:
+
+```bash
+git clone git@github.com:rnljul/SentinelBot.git
+cd SentinelBot
+cp .env.example .env
+```
+
+Edit `.env` with your real `TELEGRAM_BOT_TOKEN`, then run:
+
+```bash
+docker compose up -d --build
+```
