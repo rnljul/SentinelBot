@@ -24,6 +24,8 @@ LOGGER = logging.getLogger("media_guard_bot")
 ADMIN_STATUSES = {"administrator", "creator", "owner"}
 GROUP_TYPES = {"group", "supergroup"}
 DURATION_PATTERN = re.compile(r"^(?P<amount>\d+)(?P<unit>[mhd])$")
+DEFAULT_RESTRICTION_DURATION = "4h"
+DEFAULT_RESTRICTION_REASON = "irrelevant content"
 
 
 @dataclass(frozen=True)
@@ -401,14 +403,22 @@ def parse_target_and_duration(
         return target.id, target.full_name, duration_seconds, reason
 
     if len(args) < 2:
-        raise ValueError(
-            "Reply to a user's message with /restrict_media 4h [reason], "
-            "or use /restrict_media @username 4h [reason]."
+        if not args:
+            raise ValueError(
+                "Reply to a user's message with /restrict_media 4h [reason], "
+                "or use /restrict_media @username [duration] [reason]."
+            )
+        user_id, display_name = resolve_target(chat_id, store, args[0])
+        return (
+            user_id,
+            display_name,
+            parse_duration(DEFAULT_RESTRICTION_DURATION),
+            DEFAULT_RESTRICTION_REASON,
         )
 
     user_id, display_name = resolve_target(chat_id, store, args[0])
     duration_seconds = parse_duration(args[1])
-    reason = " ".join(args[2:]).strip()
+    reason = " ".join(args[2:]).strip() or DEFAULT_RESTRICTION_REASON
     return user_id, display_name, duration_seconds, reason
 
 
@@ -603,7 +613,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Media Guard is running.\n\n"
         "Admin commands:\n"
         "/restrict_media 4h [reason] - reply to a user's message\n"
-        "/restrict_media @username 4h [reason] - in private chat after MODERATION_CHAT_ID is set\n"
+        "/restrict_media @username [duration] [reason] - private chat, defaults to 4h irrelevant content\n"
         "/unrestrict_media - reply to a user's message\n"
         "/find_user username_or_name - search known users\n"
         "/chat_id - show the current group id\n"

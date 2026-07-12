@@ -76,8 +76,14 @@ Or use a numeric Telegram user id:
 In private chat with the bot, after `MODERATION_CHAT_ID` is set:
 
 ```text
+/restrict_media @someuser
 /restrict_media @someuser 4h posted prohibited media
 ```
+
+If duration and reason are omitted, SentinelBot uses:
+
+- Duration: `4h`
+- Reason: `irrelevant content`
 
 Supported durations:
 
