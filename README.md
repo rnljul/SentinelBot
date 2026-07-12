@@ -11,6 +11,7 @@ Important Telegram limitation: this is for a group or supergroup, including a ch
 - If a restricted user posts a photo/video, the bot deletes it and sends a notice with the remaining restriction time.
 - Expired restrictions are lifted automatically the next time the user posts or an admin lists restrictions.
 - Restrictions are persisted in SQLite.
+- Admins can use private chat commands after `MODERATION_CHAT_ID` is configured.
 
 ## Setup
 
@@ -44,9 +45,19 @@ Important Telegram limitation: this is for a group or supergroup, including a ch
    python bot.py
    ```
 
+8. In the group, run:
+
+   ```text
+   /chat_id
+   ```
+
+   Put the returned value into `.env` as `MODERATION_CHAT_ID`. Restart the bot after changing `.env`.
+
 ## Admin Commands
 
-Use the reply-based commands when possible. Telegram bots cannot reliably convert an `@username` into a user id unless that user is already known through a message.
+Use the reply-based commands when working directly in the group. In private chat with the bot, use `@username` after the bot has seen that user post in the group.
+
+Telegram bots cannot reliably convert any random `@username` into a user id. SentinelBot stores a local known-users table from messages it sees in the group. If a user has never posted while the bot was running, ask them to post once or use a reply-based group command.
 
 ### Restrict a user
 
@@ -60,6 +71,12 @@ Or use a numeric Telegram user id:
 
 ```text
 /restrict_media 123456789 4h posted prohibited media
+```
+
+In private chat with the bot, after `MODERATION_CHAT_ID` is set:
+
+```text
+/restrict_media @someuser 4h posted prohibited media
 ```
 
 Supported durations:
@@ -81,6 +98,32 @@ Or use a numeric Telegram user id:
 ```text
 /unrestrict_media 123456789
 ```
+
+In private chat with the bot:
+
+```text
+/unrestrict_media @someuser
+```
+
+### Find a user
+
+In private chat with the bot:
+
+```text
+/find_user someuser
+```
+
+This searches users the bot has already seen in the configured group and returns usernames plus numeric user IDs.
+
+### Get the group chat id
+
+In the group:
+
+```text
+/chat_id
+```
+
+Copy the returned `MODERATION_CHAT_ID` value into `.env`, then restart the bot. Private admin commands need this because a private chat does not tell the bot which group you want to moderate.
 
 ### List active restrictions
 

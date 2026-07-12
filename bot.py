@@ -37,6 +37,15 @@ class Restriction:
     created_ts: int
 
 
+@dataclass(frozen=True)
+class KnownUser:
+    chat_id: int
+    user_id: int
+    username: str
+    display_name: str
+    last_seen_ts: int
+
+
 class RestrictionStore:
     def __init__(self, database_path: str) -> None:
         self.database_path = database_path
@@ -62,6 +71,25 @@ class RestrictionStore:
                     created_ts INTEGER NOT NULL,
                     PRIMARY KEY (chat_id, user_id)
                 )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS known_users (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    username TEXT NOT NULL DEFAULT '',
+                    username_key TEXT NOT NULL DEFAULT '',
+                    display_name TEXT NOT NULL DEFAULT '',
+                    last_seen_ts INTEGER NOT NULL,
+                    PRIMARY KEY (chat_id, user_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_known_users_username
+                ON known_users (chat_id, username_key)
                 """
             )
 
@@ -139,6 +167,59 @@ class RestrictionStore:
             ).fetchall()
         return [Restriction(**dict(row)) for row in rows]
 
+    def remember_user(self, chat_id: int, user: User) -> None:
+        if user.is_bot:
+            return
+
+        now = int(time.time())
+        username = user.username or ""
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO known_users (
+                    chat_id, user_id, username, username_key, display_name, last_seen_ts
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                    username = excluded.username,
+                    username_key = excluded.username_key,
+                    display_name = excluded.display_name,
+                    last_seen_ts = excluded.last_seen_ts
+                """,
+                (chat_id, user.id, username, username.lower(), user.full_name, now),
+            )
+
+    def get_known_user_by_username(self, chat_id: int, username: str) -> Optional[KnownUser]:
+        username_key = username.lower().lstrip("@")
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT chat_id, user_id, username, display_name, last_seen_ts
+                FROM known_users
+                WHERE chat_id = ? AND username_key = ?
+                """,
+                (chat_id, username_key),
+            ).fetchone()
+
+        return KnownUser(**dict(row)) if row else None
+
+    def search_known_users(self, chat_id: int, query: str, limit: int = 10) -> list[KnownUser]:
+        query_key = f"%{query.lower().lstrip('@')}%"
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT chat_id, user_id, username, display_name, last_seen_ts
+                FROM known_users
+                WHERE chat_id = ?
+                  AND (username_key LIKE ? OR lower(display_name) LIKE ? OR CAST(user_id AS TEXT) = ?)
+                ORDER BY last_seen_ts DESC
+                LIMIT ?
+                """,
+                (chat_id, query_key, query_key, query, limit),
+            ).fetchall()
+
+        return [KnownUser(**dict(row)) for row in rows]
+
 
 def load_env_file(path: str = ".env") -> None:
     env_path = Path(path)
@@ -188,6 +269,11 @@ def mention_user(user_id: int, display_name: str) -> str:
     return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
 
 
+def display_known_user(user: KnownUser) -> str:
+    username = f"@{html.escape(user.username)}" if user.username else "no username"
+    return f"{mention_user(user.user_id, user.display_name)} ({username}, id: <code>{user.user_id}</code>)"
+
+
 def target_from_reply(message: Message) -> Optional[User]:
     if message.reply_to_message and message.reply_to_message.from_user:
         return message.reply_to_message.from_user
@@ -220,6 +306,20 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return member.status in ADMIN_STATUSES
 
 
+async def is_admin_in_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+    except TelegramError as exc:
+        LOGGER.warning("Could not check admin status in %s: %s", chat_id, exc)
+        return False
+
+    return member.status in ADMIN_STATUSES
+
+
+def configured_moderation_chat_id(context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    return context.bot_data.get("moderation_chat_id")
+
+
 async def require_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     chat = update.effective_chat
     message = update.effective_message
@@ -237,7 +337,61 @@ async def require_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE
     return True
 
 
-def parse_target_and_duration(message: Message, args: list[str]) -> tuple[int, str, int, str]:
+async def get_moderation_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    chat = update.effective_chat
+    user = update.effective_user
+    message = update.effective_message
+    if chat is None or user is None or message is None:
+        return None
+
+    if chat.type in GROUP_TYPES:
+        if not await require_group_admin(update, context):
+            return None
+        return chat.id
+
+    if chat.type != "private":
+        await message.reply_text("Use this command in a group or in a private chat with the bot.")
+        return None
+
+    moderation_chat_id = configured_moderation_chat_id(context)
+    if moderation_chat_id is None:
+        await message.reply_text(
+            "Private admin commands need MODERATION_CHAT_ID in .env. "
+            "Run /chat_id in the target group, then set that value."
+        )
+        return None
+
+    if not await is_admin_in_chat(context, moderation_chat_id, user.id):
+        await message.reply_text("Only admins of the configured moderation group can use this command.")
+        return None
+
+    return moderation_chat_id
+
+
+def resolve_target(chat_id: int, store: RestrictionStore, target_text: str) -> tuple[int, str]:
+    if target_text.startswith("@"):
+        known_user = store.get_known_user_by_username(chat_id, target_text)
+        if known_user is None:
+            raise ValueError(
+                f"I do not know {target_text} yet. Use /find_user {target_text} or ask them "
+                "to send one message in the group first."
+            )
+        return known_user.user_id, known_user.display_name
+
+    try:
+        user_id = int(target_text)
+    except ValueError as exc:
+        raise ValueError("Use a reply, @username that the bot has seen, or a numeric user ID.") from exc
+
+    return user_id, str(user_id)
+
+
+def parse_target_and_duration(
+    message: Message,
+    args: list[str],
+    chat_id: int,
+    store: RestrictionStore,
+) -> tuple[int, str, int, str]:
     target = target_from_reply(message)
     if target:
         if not args:
@@ -249,57 +403,55 @@ def parse_target_and_duration(message: Message, args: list[str]) -> tuple[int, s
     if len(args) < 2:
         raise ValueError(
             "Reply to a user's message with /restrict_media 4h [reason], "
-            "or use /restrict_media USER_ID 4h [reason]."
+            "or use /restrict_media @username 4h [reason]."
         )
 
-    try:
-        user_id = int(args[0])
-    except ValueError as exc:
-        raise ValueError("Direct restrictions need a numeric USER_ID. Reply mode is easiest.") from exc
-
+    user_id, display_name = resolve_target(chat_id, store, args[0])
     duration_seconds = parse_duration(args[1])
     reason = " ".join(args[2:]).strip()
-    return user_id, str(user_id), duration_seconds, reason
+    return user_id, display_name, duration_seconds, reason
 
 
-def parse_unrestrict_target(message: Message, args: list[str]) -> tuple[int, str]:
+def parse_unrestrict_target(
+    message: Message,
+    args: list[str],
+    chat_id: int,
+    store: RestrictionStore,
+) -> tuple[int, str]:
     target = target_from_reply(message)
     if target:
         return target.id, target.full_name
 
     if not args:
-        raise ValueError("Reply with /unrestrict_media, or use /unrestrict_media USER_ID.")
+        raise ValueError("Reply with /unrestrict_media, or use /unrestrict_media @username.")
 
-    try:
-        user_id = int(args[0])
-    except ValueError as exc:
-        raise ValueError("Direct unrestrict needs a numeric USER_ID. Reply mode is easiest.") from exc
-
-    return user_id, str(user_id)
+    return resolve_target(chat_id, store, args[0])
 
 
 async def restrict_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_group_admin(update, context):
+    chat_id = await get_moderation_chat_id(update, context)
+    if chat_id is None:
         return
 
     message = update.effective_message
-    chat = update.effective_chat
     admin = update.effective_user
-    assert message is not None and chat is not None and admin is not None
+    assert message is not None and admin is not None
+    store: RestrictionStore = context.bot_data["store"]
 
     try:
         user_id, display_name, duration_seconds, reason = parse_target_and_duration(
             message,
             list(context.args),
+            chat_id,
+            store,
         )
     except ValueError as exc:
         await message.reply_text(str(exc))
         return
 
     until_ts = int(time.time()) + duration_seconds
-    store: RestrictionStore = context.bot_data["store"]
     store.restrict(
-        chat_id=chat.id,
+        chat_id=chat_id,
         user_id=user_id,
         until_ts=until_ts,
         reason=reason,
@@ -315,21 +467,21 @@ async def restrict_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def unrestrict_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_group_admin(update, context):
+    chat_id = await get_moderation_chat_id(update, context)
+    if chat_id is None:
         return
 
     message = update.effective_message
-    chat = update.effective_chat
-    assert message is not None and chat is not None
+    assert message is not None
+    store: RestrictionStore = context.bot_data["store"]
 
     try:
-        user_id, display_name = parse_unrestrict_target(message, list(context.args))
+        user_id, display_name = parse_unrestrict_target(message, list(context.args), chat_id, store)
     except ValueError as exc:
         await message.reply_text(str(exc))
         return
 
-    store: RestrictionStore = context.bot_data["store"]
-    removed = store.remove(chat.id, user_id)
+    removed = store.remove(chat_id, user_id)
     if removed:
         await message.reply_html(f"{mention_user(user_id, display_name)} can post images and videos again.")
     else:
@@ -337,15 +489,15 @@ async def unrestrict_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def list_restrictions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_group_admin(update, context):
+    chat_id = await get_moderation_chat_id(update, context)
+    if chat_id is None:
         return
 
     message = update.effective_message
-    chat = update.effective_chat
-    assert message is not None and chat is not None
+    assert message is not None
 
     store: RestrictionStore = context.bot_data["store"]
-    restrictions = store.list_active(chat.id)
+    restrictions = store.list_active(chat_id)
     if not restrictions:
         await message.reply_text("No active media restrictions in this chat.")
         return
@@ -361,6 +513,46 @@ async def list_restrictions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await message.reply_html("\n".join(lines), disable_web_page_preview=True)
 
 
+async def find_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = await get_moderation_chat_id(update, context)
+    if chat_id is None:
+        return
+
+    message = update.effective_message
+    assert message is not None
+
+    query = " ".join(context.args).strip()
+    if not query:
+        await message.reply_text("Use /find_user username_or_name.")
+        return
+
+    store: RestrictionStore = context.bot_data["store"]
+    matches = store.search_known_users(chat_id, query)
+    if not matches:
+        await message.reply_text("No known users found. The bot learns users after they post in the group.")
+        return
+
+    lines = ["Known users:"]
+    lines.extend(f"- {display_known_user(match)}" for match in matches)
+    await message.reply_html("\n".join(lines), disable_web_page_preview=True)
+
+
+async def chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+
+    if chat.type not in GROUP_TYPES:
+        await message.reply_text("Use /chat_id in the group you want to moderate.")
+        return
+
+    if not await require_group_admin(update, context):
+        return
+
+    await message.reply_html(f"Set this in .env:\n<code>MODERATION_CHAT_ID={chat.id}</code>")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     chat = update.effective_chat
@@ -368,10 +560,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if message is None or chat is None or user is None:
         return
 
+    store: RestrictionStore = context.bot_data["store"]
+    if chat.type in GROUP_TYPES:
+        store.remember_user(chat.id, user)
+
     if chat.type not in GROUP_TYPES or not is_image_or_video(message):
         return
 
-    store: RestrictionStore = context.bot_data["store"]
     restriction = store.get(chat.id, user.id)
     if restriction is None:
         return
@@ -408,7 +603,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Media Guard is running.\n\n"
         "Admin commands:\n"
         "/restrict_media 4h [reason] - reply to a user's message\n"
+        "/restrict_media @username 4h [reason] - in private chat after MODERATION_CHAT_ID is set\n"
         "/unrestrict_media - reply to a user's message\n"
+        "/find_user username_or_name - search known users\n"
+        "/chat_id - show the current group id\n"
         "/media_restrictions - list active restrictions"
     )
 
@@ -421,15 +619,19 @@ def main() -> None:
         raise RuntimeError("Set TELEGRAM_BOT_TOKEN before starting the bot.")
 
     database_path = os.getenv("DATABASE_PATH", "data/media_restrictions.sqlite3")
+    moderation_chat_id = os.getenv("MODERATION_CHAT_ID")
     store = RestrictionStore(database_path)
 
     application = Application.builder().token(token).build()
     application.bot_data["store"] = store
+    application.bot_data["moderation_chat_id"] = int(moderation_chat_id) if moderation_chat_id else None
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("restrict_media", restrict_media))
     application.add_handler(CommandHandler("unrestrict_media", unrestrict_media))
     application.add_handler(CommandHandler("media_restrictions", list_restrictions))
+    application.add_handler(CommandHandler("find_user", find_user))
+    application.add_handler(CommandHandler("chat_id", chat_id))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
     LOGGER.info("Starting media guard bot")
