@@ -9,6 +9,7 @@ Important Telegram limitation: this is for a group or supergroup, including a ch
 - Admins can restrict a user from posting images/videos for a duration.
 - Restricted users can still send text messages.
 - If a restricted user posts a photo/video, the bot deletes it and sends a notice with the remaining restriction time.
+- Admins can delete the latest stored media posts from a user.
 - Expired restrictions are lifted automatically the next time the user posts or an admin lists restrictions.
 - Restrictions are persisted in SQLite.
 - Admins can use private chat commands after `MODERATION_CHAT_ID` is configured.
@@ -110,6 +111,32 @@ In private chat with the bot:
 ```text
 /unrestrict_media @someuser
 ```
+
+### Delete latest media posts
+
+In private chat with the bot:
+
+```text
+/del_post @someuser
+/del_post @someuser 3
+```
+
+The optional `count` argument controls how many of that user's latest media posts to delete. It defaults to `1`.
+
+The clearer alias also works:
+
+```text
+/delete_media @someuser 3
+```
+
+You can also reply to a user's message in the group:
+
+```text
+/del_post
+/del_post 3
+```
+
+SentinelBot can delete only media posts it has seen while running. Telegram bots cannot search old chat history by user.
 
 ### Find a user
 

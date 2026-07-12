@@ -48,6 +48,14 @@ class KnownUser:
     last_seen_ts: int
 
 
+@dataclass(frozen=True)
+class MediaPost:
+    chat_id: int
+    user_id: int
+    message_id: int
+    created_ts: int
+
+
 class RestrictionStore:
     def __init__(self, database_path: str) -> None:
         self.database_path = database_path
@@ -92,6 +100,23 @@ class RestrictionStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_known_users_username
                 ON known_users (chat_id, username_key)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS media_posts (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    created_ts INTEGER NOT NULL,
+                    PRIMARY KEY (chat_id, message_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_media_posts_user_latest
+                ON media_posts (chat_id, user_id, created_ts DESC)
                 """
             )
 
@@ -221,6 +246,38 @@ class RestrictionStore:
             ).fetchall()
 
         return [KnownUser(**dict(row)) for row in rows]
+
+    def remember_media_post(self, chat_id: int, user_id: int, message_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO media_posts (chat_id, user_id, message_id, created_ts)
+                VALUES (?, ?, ?, ?)
+                """,
+                (chat_id, user_id, message_id, int(time.time())),
+            )
+
+    def latest_media_posts(self, chat_id: int, user_id: int, limit: int) -> list[MediaPost]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT chat_id, user_id, message_id, created_ts
+                FROM media_posts
+                WHERE chat_id = ? AND user_id = ?
+                ORDER BY created_ts DESC, message_id DESC
+                LIMIT ?
+                """,
+                (chat_id, user_id, limit),
+            ).fetchall()
+
+        return [MediaPost(**dict(row)) for row in rows]
+
+    def forget_media_post(self, chat_id: int, message_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM media_posts WHERE chat_id = ? AND message_id = ?",
+                (chat_id, message_id),
+            )
 
 
 def load_env_file(path: str = ".env") -> None:
@@ -438,6 +495,38 @@ def parse_unrestrict_target(
     return resolve_target(chat_id, store, args[0])
 
 
+def parse_positive_count(value: str) -> int:
+    try:
+        count = int(value)
+    except ValueError as exc:
+        raise ValueError("Count must be a number, for example /del_post @username 3.") from exc
+
+    if count <= 0:
+        raise ValueError("Count must be greater than zero.")
+    if count > 50:
+        raise ValueError("Count is too high. Use 50 or less.")
+    return count
+
+
+def parse_delete_media_args(
+    message: Message,
+    args: list[str],
+    chat_id: int,
+    store: RestrictionStore,
+) -> tuple[int, str, int]:
+    target = target_from_reply(message)
+    if target:
+        count = parse_positive_count(args[0]) if args else 1
+        return target.id, target.full_name, count
+
+    if not args:
+        raise ValueError("Use /del_post @username [count], or reply with /del_post [count].")
+
+    user_id, display_name = resolve_target(chat_id, store, args[0])
+    count = parse_positive_count(args[1]) if len(args) > 1 else 1
+    return user_id, display_name, count
+
+
 async def restrict_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = await get_moderation_chat_id(update, context)
     if chat_id is None:
@@ -523,6 +612,52 @@ async def list_restrictions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await message.reply_html("\n".join(lines), disable_web_page_preview=True)
 
 
+async def delete_media_posts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = await get_moderation_chat_id(update, context)
+    if chat_id is None:
+        return
+
+    message = update.effective_message
+    assert message is not None
+    store: RestrictionStore = context.bot_data["store"]
+
+    try:
+        user_id, display_name, count = parse_delete_media_args(message, list(context.args), chat_id, store)
+    except ValueError as exc:
+        await message.reply_text(str(exc))
+        return
+
+    posts = store.latest_media_posts(chat_id, user_id, count)
+    if not posts:
+        await message.reply_html(
+            f"No stored media posts found for {mention_user(user_id, display_name)}. "
+            "The bot can delete only media it has seen while running.",
+            disable_web_page_preview=True,
+        )
+        return
+
+    deleted = 0
+    failed = 0
+    for post in posts:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=post.message_id)
+        except TelegramError as exc:
+            failed += 1
+            LOGGER.warning("Could not delete media post %s in %s: %s", post.message_id, chat_id, exc)
+        else:
+            deleted += 1
+            store.forget_media_post(chat_id, post.message_id)
+
+    summary = (
+        f"Deleted {deleted} latest media post"
+        f"{'' if deleted == 1 else 's'} from {mention_user(user_id, display_name)}."
+    )
+    if failed:
+        summary += f"\nCould not delete {failed}. Check bot admin permissions or message age."
+
+    await message.reply_html(summary, disable_web_page_preview=True)
+
+
 async def find_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = await get_moderation_chat_id(update, context)
     if chat_id is None:
@@ -577,6 +712,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if chat.type not in GROUP_TYPES or not is_image_or_video(message):
         return
 
+    store.remember_media_post(chat.id, user.id, message.message_id)
     restriction = store.get(chat.id, user.id)
     if restriction is None:
         return
@@ -594,6 +730,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except TelegramError as exc:
         LOGGER.warning("Could not delete restricted media message: %s", exc)
         notice += "\n\nBot could not delete the message. Check bot admin permissions."
+    else:
+        store.forget_media_post(chat.id, message.message_id)
 
     await context.bot.send_message(
         chat_id=chat.id,
@@ -615,6 +753,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/restrict_media 4h [reason] - reply to a user's message\n"
         "/restrict_media @username [duration] [reason] - private chat, defaults to 4h irrelevant content\n"
         "/unrestrict_media - reply to a user's message\n"
+        "/del_post @username [count] - delete latest stored media posts, defaults to 1\n"
         "/find_user username_or_name - search known users\n"
         "/chat_id - show the current group id\n"
         "/media_restrictions - list active restrictions"
@@ -640,6 +779,7 @@ def main() -> None:
     application.add_handler(CommandHandler("restrict_media", restrict_media))
     application.add_handler(CommandHandler("unrestrict_media", unrestrict_media))
     application.add_handler(CommandHandler("media_restrictions", list_restrictions))
+    application.add_handler(CommandHandler(["del_post", "delpost", "delPost", "delete_media"], delete_media_posts))
     application.add_handler(CommandHandler("find_user", find_user))
     application.add_handler(CommandHandler("chat_id", chat_id))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
